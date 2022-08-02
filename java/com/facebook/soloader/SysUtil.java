@@ -28,6 +28,7 @@ import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.util.Log;
+import dalvik.system.BaseDexClassLoader;
 import java.io.DataOutput;
 import java.io.File;
 import java.io.FileDescriptor;
@@ -35,6 +36,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Enumeration;
@@ -345,7 +347,7 @@ public final class SysUtil {
    * N.B. If this method is changed, the above method {@link #getApkDepBlockLength} must also be
    * updated to reflect the expected size of the dep block
    */
-  public static byte[] makeApkDepBlock(File apkFile, Context context) throws IOException {
+  public static byte[] makeApkDepBlock(File apkFile, final Context context) throws IOException {
     apkFile = apkFile.getCanonicalFile();
     Parcel parcel = Parcel.obtain();
     try {
@@ -359,7 +361,7 @@ public final class SysUtil {
     }
   }
 
-  public static int getAppVersionCode(Context context) {
+  public static int getAppVersionCode(final Context context) {
     final PackageManager pm = context.getPackageManager();
     if (pm != null) {
       try {
@@ -411,25 +413,26 @@ public final class SysUtil {
       File soDirectory, File lockFileName, boolean blocking) throws IOException {
     boolean notWritable = false;
     try {
-      if (blocking) {
-        return FileLocker.lock(lockFileName);
-      } else {
-        return FileLocker.tryLock(lockFileName);
-      }
+      return getFileLocker(lockFileName, blocking);
     } catch (FileNotFoundException e) {
       notWritable = true;
       if (!soDirectory.setWritable(true)) {
         throw e;
       }
-      if (blocking) {
-        return FileLocker.lock(lockFileName);
-      } else {
-        return FileLocker.tryLock(lockFileName);
-      }
+      return getFileLocker(lockFileName, blocking);
     } finally {
       if (notWritable && !soDirectory.setWritable(false)) {
         Log.w(TAG, "error removing " + soDirectory.getCanonicalPath() + " write permission");
       }
+    }
+  }
+
+  private static @Nullable FileLocker getFileLocker(File lockFileName, boolean blocking)
+      throws IOException {
+    if (blocking) {
+      return FileLocker.lock(lockFileName);
+    } else {
+      return FileLocker.tryLock(lockFileName);
     }
   }
 
@@ -440,5 +443,29 @@ public final class SysUtil {
       return fileName.substring(0, index);
     }
     return fileName;
+  }
+
+  @DoNotOptimize
+  @TargetApi(14)
+  public static class Api14Utils {
+    public static String getClassLoaderLdLoadLibrary() {
+      final ClassLoader classLoader = SoLoader.class.getClassLoader();
+
+      if (classLoader != null && !(classLoader instanceof BaseDexClassLoader)) {
+        throw new IllegalStateException(
+            "ClassLoader "
+                + classLoader.getClass().getName()
+                + " should be of type BaseDexClassLoader");
+      }
+      try {
+        final BaseDexClassLoader baseDexClassLoader = (BaseDexClassLoader) classLoader;
+        final Method getLdLibraryPathMethod =
+            BaseDexClassLoader.class.getMethod("getLdLibraryPath");
+
+        return (String) getLdLibraryPathMethod.invoke(baseDexClassLoader);
+      } catch (Exception e) {
+        throw new RuntimeException("Cannot call getLdLibraryPath", e);
+      }
+    }
   }
 }

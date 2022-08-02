@@ -16,7 +16,6 @@
 
 package com.facebook.soloader;
 
-import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.os.Build;
@@ -24,7 +23,6 @@ import android.os.StrictMode;
 import android.text.TextUtils;
 import android.util.Log;
 import com.facebook.soloader.nativeloader.NativeLoader;
-import dalvik.system.BaseDexClassLoader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -92,7 +90,7 @@ public class SoLoader {
    */
   @GuardedBy("sSoSourcesLock")
   @Nullable
-  private static SoSource[] sSoSources = null;
+  private static volatile SoSource[] sSoSources = null;
 
   @GuardedBy("sSoSourcesLock")
   private static final AtomicInteger sSoSourcesVersion = new AtomicInteger(0);
@@ -173,6 +171,18 @@ public class SoLoader {
   /** System Apps ignore PREFER_ANDROID_LIBS_DIRECTORY. Don't do that for this app. */
   public static final int SOLOADER_DONT_TREAT_AS_SYSTEMAPP = (1 << 5);
 
+  /**
+   * In API level 23 and above, it’s possible to open a .so file directly from your APK. Enabling
+   * this flag will explicitly add the direct SoSource in soSource list.
+   */
+  public static final int SOLOADER_ENABLE_DIRECT_SOSOURCE = (1 << 6);
+
+  /**
+   * For compatibility, we need explicitly enable the backup soSource. This flag conflicts with
+   * {@link #SOLOADER_DISABLE_BACKUP_SOSOURCE}, you should only set one of them or none.
+   */
+  public static final int SOLOADER_EXPLICITLY_ENABLE_BACKUP_SOSOURCE = (1 << 7);
+
   @GuardedBy("sSoSourcesLock")
   private static int sFlags;
 
@@ -227,14 +237,19 @@ public class SoLoader {
   public static void init(
       Context context, int flags, @Nullable SoFileLoader soFileLoader, String[] denyList)
       throws IOException {
+    if (isInitialized()) {
+      return;
+    }
+
     StrictMode.ThreadPolicy oldPolicy = StrictMode.allowThreadDiskWrites();
     try {
-      if (SysUtil.isDisabledExtractNativeLibs(context)) {
-        // SoLoader doesn't need backup soSource if android:extractNativeLibs == false
-        flags |= SOLOADER_DISABLE_BACKUP_SOSOURCE;
+      sAppType = getAppType(context, flags);
+      if ((flags & SOLOADER_EXPLICITLY_ENABLE_BACKUP_SOSOURCE) == 0
+          && SysUtil.isSupportedDirectLoad(context, sAppType)) {
+        // SoLoader doesn't need backup soSource if it supports directly loading .so file from APK
+        flags |= (SOLOADER_DISABLE_BACKUP_SOSOURCE | SOLOADER_ENABLE_DIRECT_SOSOURCE);
       }
 
-      sAppType = getAppType(context, flags);
       initSoLoader(soFileLoader);
       initSoSources(context, flags, denyList);
       NativeLoader.initIfUninitialized(new NativeLoaderToSoLoaderDelegate());
@@ -265,6 +280,13 @@ public class SoLoader {
     }
 
     sSoSourcesLock.writeLock().lock();
+
+    // Double check that sSoSources wasn't initialized while waiting for the lock.
+    if (sSoSources != null) {
+      sSoSourcesLock.writeLock().unlock();
+      return;
+    }
+
     try {
       sFlags = flags;
 
@@ -289,7 +311,7 @@ public class SoLoader {
           }
           soSources.add(0, new ExoSoSource(context, SO_STORE_NAME_MAIN));
         } else {
-          if (SysUtil.isSupportedDirectLoad(context, sAppType)) {
+          if ((flags & SOLOADER_ENABLE_DIRECT_SOSOURCE) != 0) {
             addDirectApkSoSource(context, soSources);
           }
           addApplicationSoSource(context, soSources, getApplicationSoSourceFlags());
@@ -303,7 +325,14 @@ public class SoLoader {
         if (Log.isLoggable(TAG, Log.DEBUG)) {
           Log.d(TAG, "Preparing SO source: " + finalSoSources[i]);
         }
+
+        if (SYSTRACE_LIBRARY_LOADING) {
+          Api18TraceUtils.beginTraceSection(TAG, "_", finalSoSources[i].getClass().getSimpleName());
+        }
         finalSoSources[i].prepare(prepareFlags);
+        if (SYSTRACE_LIBRARY_LOADING) {
+          Api18TraceUtils.endSection();
+        }
       }
       sSoSources = finalSoSources;
       sSoSourcesVersion.getAndIncrement();
@@ -482,7 +511,7 @@ public class SoLoader {
     final boolean hasNativeLoadMethod = nativeLoadRuntimeMethod != null;
 
     final String localLdLibraryPath =
-        hasNativeLoadMethod ? Api14Utils.getClassLoaderLdLoadLibrary() : null;
+        hasNativeLoadMethod ? SysUtil.Api14Utils.getClassLoaderLdLoadLibrary() : null;
     final String localLdLibraryPathNoZips = makeNonZipPath(localLdLibraryPath);
 
     sSoFileLoader =
@@ -1145,6 +1174,9 @@ public class SoLoader {
   }
 
   public static boolean isInitialized() {
+    if (sSoSources != null) {
+      return true;
+    }
     sSoSourcesLock.readLock().lock();
     try {
       return sSoSources != null;
@@ -1240,33 +1272,31 @@ public class SoLoader {
     }
   }
 
-  public static boolean useDepsFile(Context context, String depsFilePath) throws IOException {
-    File apkFile = new File(context.getApplicationInfo().sourceDir);
-    byte[] apkId = SysUtil.makeApkDepBlock(apkFile, context);
-    return NativeDeps.useDepsFile(apkId, depsFilePath);
+  /**
+   * Enables the use of a deps file to fetch the native library dependencies to avoid reading them
+   * from the ELF files. The file is expected to be in the APK in assets/native_deps.txt. Returns
+   * true on success, false on failure. On failure, dependencies will be read from ELF files instead
+   * of the deps file.
+   *
+   * @param context - Application context, used to find native deps file in APK
+   * @param async - If true, initialization will occur in a background thread and we library loading
+   *     will wait for initialization to complete.
+   * @param extractToDisk - If true, the native deps file will be extract from the APK and written
+   *     to disk. This can be useful when the file is compressed in the APK, since we can prevent
+   *     decompressing the file every time.
+   * @return True if initialization succeeded, false otherwise. Always returns true if async is
+   *     true.
+   */
+  public static boolean useDepsFile(Context context, boolean async, boolean extractToDisk) {
+    return NativeDeps.useDepsFile(context, async, extractToDisk);
   }
 
-  @DoNotOptimize
-  @TargetApi(14)
-  /* package */ static class Api14Utils {
-    public static String getClassLoaderLdLoadLibrary() {
-      final ClassLoader classLoader = SoLoader.class.getClassLoader();
-
-      if (classLoader != null && !(classLoader instanceof BaseDexClassLoader)) {
-        throw new IllegalStateException(
-            "ClassLoader "
-                + classLoader.getClass().getName()
-                + " should be of type BaseDexClassLoader");
-      }
-      try {
-        final BaseDexClassLoader baseDexClassLoader = (BaseDexClassLoader) classLoader;
-        final Method getLdLibraryPathMethod =
-            BaseDexClassLoader.class.getMethod("getLdLibraryPath");
-
-        return (String) getLdLibraryPathMethod.invoke(baseDexClassLoader);
-      } catch (Exception e) {
-        throw new RuntimeException("Cannot call getLdLibraryPath", e);
-      }
-    }
+  /**
+   * Returns count of already loaded so libraries
+   *
+   * @return number of loaded libraries
+   */
+  public static int getLoadedLibrariesCount() {
+    return sLoadedLibraries.size();
   }
 }

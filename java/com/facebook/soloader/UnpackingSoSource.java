@@ -414,43 +414,7 @@ public abstract class UnpackingSoSource extends DirectorySoSource {
 
     final DsoManifest manifest = desiredManifest;
 
-    Runnable syncer =
-        new Runnable() {
-          @Override
-          public void run() {
-            try {
-              try {
-                Log.v(TAG, "starting syncer worker");
-
-                // N.B. We can afford to write the deps file and the manifest file without
-                // synchronization or fsyncs because we've marked the DSO store STATE_DIRTY, which
-                // will cause us to ignore all intermediate state when regenerating it.  That is,
-                // it's okay for the depsFile or manifestFile blocks to hit the disk before the
-                // actual DSO data file blocks as long as both hit the disk before we reset
-                // STATE_CLEAN.
-
-                try (RandomAccessFile depsFile = new RandomAccessFile(depsFileName, "rw")) {
-                  depsFile.write(deps);
-                  depsFile.setLength(depsFile.getFilePointer());
-                }
-
-                File manifestFileName = new File(soDirectory, MANIFEST_FILE_NAME);
-                try (RandomAccessFile manifestFile = new RandomAccessFile(manifestFileName, "rw")) {
-                  manifest.write(manifestFile);
-                }
-
-                SysUtil.fsyncRecursive(soDirectory);
-                writeState(stateFileName, STATE_CLEAN);
-              } finally {
-                Log.v(TAG, "releasing dso store lock for " + soDirectory + " (from syncer thread)");
-                lock.close();
-              }
-            } catch (IOException ex) {
-              throw new RuntimeException(ex);
-            }
-          }
-        };
-
+    Runnable syncer = createSyncer(lock, deps, stateFileName, depsFileName, manifest, false);
     if ((flags & PREPARE_FLAG_ALLOW_ASYNC_INIT) != 0) {
       new Thread(syncer, "SoSync:" + soDirectory.getName()).start();
     } else {
@@ -458,6 +422,52 @@ public abstract class UnpackingSoSource extends DirectorySoSource {
     }
 
     return true;
+  }
+
+  private Runnable createSyncer(
+      final FileLocker lock,
+      final byte[] deps,
+      final File stateFileName,
+      final File depsFileName,
+      final DsoManifest manifest,
+      final Boolean quietly) {
+    return new Runnable() {
+      @Override
+      public void run() {
+        try {
+          try {
+            Log.v(TAG, "starting syncer worker");
+
+            // N.B. We can afford to write the deps file and the manifest file without
+            // synchronization or fsyncs because we've marked the DSO store STATE_DIRTY, which
+            // will cause us to ignore all intermediate state when regenerating it.  That is,
+            // it's okay for the depsFile or manifestFile blocks to hit the disk before the
+            // actual DSO data file blocks as long as both hit the disk before we reset
+            // STATE_CLEAN.
+
+            try (RandomAccessFile depsFile = new RandomAccessFile(depsFileName, "rw")) {
+              depsFile.write(deps);
+              depsFile.setLength(depsFile.getFilePointer());
+            }
+
+            File manifestFileName = new File(soDirectory, MANIFEST_FILE_NAME);
+            try (RandomAccessFile manifestFile = new RandomAccessFile(manifestFileName, "rw")) {
+              manifest.write(manifestFile);
+            }
+
+            SysUtil.fsyncRecursive(soDirectory);
+            writeState(stateFileName, STATE_CLEAN);
+          } finally {
+            Log.v(TAG, "releasing dso store lock for " + soDirectory + " (from syncer thread)");
+            lock.close();
+          }
+        } catch (IOException ex) {
+          if (!quietly) {
+            throw new RuntimeException(ex);
+          }
+        }
+      }
+    };
   }
 
   /**
@@ -497,28 +507,39 @@ public abstract class UnpackingSoSource extends DirectorySoSource {
   protected void prepare(int flags) throws IOException {
     SysUtil.mkdirOrThrow(soDirectory);
 
-    // LOCK_FILE_NAME is used to synchronize changes in the dso store.
-    File lockFileName = new File(soDirectory, LOCK_FILE_NAME);
-    FileLocker lock = getOrCreateLock(lockFileName, true);
-
-    // INSTANCE_LOCK_FILE_NAME is used to signal to other processes/threads that
-    // there is an initialized SoSource from which DSOs might be getting loaded.
-    // This lock is held for the entire lifetime of the process.
-    // This prevents from doing changes to DSOs which might prevent previously
-    // initialized SoSources from loading libraries.
-    if (mInstanceLock == null) {
-      File instanceLockFileName = new File(soDirectory, INSTANCE_LOCK_FILE_NAME);
-      mInstanceLock = getOrCreateLock(instanceLockFileName, false);
-    }
-
+    final boolean dirCanWrite = soDirectory.canWrite();
+    FileLocker lock = null;
     try {
+      if (!dirCanWrite && !soDirectory.setWritable(true)) {
+        Log.w(TAG, "error adding " + soDirectory.getCanonicalPath() + " write permission");
+      }
+
+      // LOCK_FILE_NAME is used to synchronize changes in the dso store.
+      File lockFileName = new File(soDirectory, LOCK_FILE_NAME);
+      lock = getOrCreateLock(lockFileName, true);
+
+      // INSTANCE_LOCK_FILE_NAME is used to signal to other processes/threads that
+      // there is an initialized SoSource from which DSOs might be getting loaded.
+      // This lock is held for the entire lifetime of the process.
+      // This prevents from doing changes to DSOs which might prevent previously
+      // initialized SoSources from loading libraries.
+      if (mInstanceLock == null) {
+        File instanceLockFileName = new File(soDirectory, INSTANCE_LOCK_FILE_NAME);
+        mInstanceLock = getOrCreateLock(instanceLockFileName, false);
+      }
+
       Log.v(TAG, "locked dso store " + soDirectory);
+
       if (refreshLocked(lock, flags, getDepsBlock())) {
         lock = null; // Lock transferred to syncer thread
       } else {
         Log.i(TAG, "dso store is up-to-date: " + soDirectory);
       }
     } finally {
+      if (!dirCanWrite && !soDirectory.setWritable(false)) {
+        Log.w(TAG, "error removing " + soDirectory.getCanonicalPath() + " write permission");
+      }
+
       if (lock != null) {
         Log.v(TAG, "releasing dso store lock for " + soDirectory);
         lock.close();

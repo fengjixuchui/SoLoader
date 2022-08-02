@@ -16,14 +16,16 @@
 
 package com.facebook.soloader;
 
+import android.content.Context;
+import android.util.Log;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.annotation.Nullable;
 
 /**
@@ -35,54 +37,145 @@ public final class NativeDeps {
   private static final int LIB_PREFIX_LEN = "lib".length();
   private static final int LIB_SUFFIX_LEN = ".so".length();
   private static final int LIB_PREFIX_SUFFIX_LEN = LIB_PREFIX_LEN + LIB_SUFFIX_LEN;
-  private static final int DEFAULT_LIBS_CAPACITY = 512;
+  private static final float HASHMAP_LOAD_FACTOR = 1f;
   private static final int INITIAL_HASH = 5381;
+  private static final int WAITING_THREADS_WARNING_THRESHOLD = 3;
+  private static final String LOG_TAG = "NativeDeps";
 
-  private static boolean sInitialized = false;
+  private static volatile boolean sInitialized = false;
   private static @Nullable byte[] sEncodedDeps;
   private static List<Integer> sPrecomputedLibs;
   private static Map<Integer, List<Integer>> sPrecomputedDeps;
 
+  private static volatile boolean sUseDepsFileAsync = false;
+  private static final ReentrantReadWriteLock sWaitForDepsFileLock = new ReentrantReadWriteLock();
+
   public static String[] getDependencies(String soName, File elfFile) throws IOException {
-    if (sInitialized) {
-      String[] deps = tryGetDepsFromPrecomputedDeps(soName);
-      if (deps != null) {
-        return deps;
-      }
+    String[] deps = awaitGetDepsFromPrecomputedDeps(soName);
+    if (deps != null) {
+      return deps;
     }
 
     return MinElf.extract_DT_NEEDED(elfFile);
   }
 
   public static String[] getDependencies(String soName, ElfByteChannel bc) throws IOException {
-    if (sPrecomputedDeps != null) {
-      String[] deps = tryGetDepsFromPrecomputedDeps(soName);
-      if (deps != null) {
-        return deps;
-      }
+    String[] deps = awaitGetDepsFromPrecomputedDeps(soName);
+    if (deps != null) {
+      return deps;
     }
 
     return MinElf.extract_DT_NEEDED(bc);
   }
 
-  /**
-   * Enables fetching dependencies from a deps file and specifies the path to the deps file. If
-   * enabled, dependencies will be looked up in the deps file instead of extracting them from the
-   * ELF file. The file is read only once when getDependencies is first called. If dependencies for
-   * a specific library are not found or the file is corrupt, we fall back to extracting the
-   * dependencies from the ELF file.
-   */
-  public static boolean useDepsFile(byte[] apkId, String depsFilePath) throws IOException {
-    if (!sInitialized) {
-      synchronized (NativeDeps.class) {
-        if (!sInitialized) {
-          return readDepsFromFile(apkId, depsFilePath);
-        }
+  @Nullable
+  private static String[] awaitGetDepsFromPrecomputedDeps(String soName) {
+    if (sInitialized) {
+      return tryGetDepsFromPrecomputedDeps(soName);
+    }
+
+    if (sUseDepsFileAsync) {
+      sWaitForDepsFileLock.readLock().lock();
+      try {
+        return tryGetDepsFromPrecomputedDeps(soName);
+      } finally {
+        sWaitForDepsFileLock.readLock().unlock();
       }
     }
 
-    throw new IllegalStateException(
-        "Trying to initialize NativeDeps but it was already initialized");
+    return null;
+  }
+
+  /**
+   * Enables fetching dependencies from a deps file expected to be in the APK. If enabled,
+   * dependencies will be looked up in the deps file instead of extracting them from the ELF file.
+   * The file is read only once when getDependencies is first called. If dependencies for a specific
+   * library are not found or the file is corrupt, we fall back to extracting the dependencies from
+   * the ELF file.
+   *
+   * @param context Application context, used to find apk file and data directory.
+   * @param async If true, native deps file initialization will be performed in a background thread,
+   *     and fetching dependencies will wait for initialization to complete. If false,
+   *     initialization is performed synchronously on this call.
+   * @return true if initialization succeeded, false otherwise. If async, always returns true.
+   */
+  public static boolean useDepsFile(
+      final Context context, boolean async, final boolean extractToDisk) {
+    if (!async) {
+      return useDepsFileFromApkSync(context, extractToDisk);
+    }
+
+    Runnable runnable =
+        new Runnable() {
+          @Override
+          public void run() {
+            sWaitForDepsFileLock.writeLock().lock();
+            sUseDepsFileAsync = true;
+            try {
+              useDepsFileFromApkSync(context, extractToDisk);
+            } finally {
+              int waitingThreads = sWaitForDepsFileLock.getReadLockCount();
+              if (waitingThreads >= WAITING_THREADS_WARNING_THRESHOLD) {
+                Log.w(
+                    LOG_TAG,
+                    "NativeDeps initialization finished with "
+                        + Integer.toString(waitingThreads)
+                        + " threads waiting.");
+              }
+              sWaitForDepsFileLock.writeLock().unlock();
+              sUseDepsFileAsync = false;
+            }
+          };
+        };
+
+    new Thread(runnable, "soloader-nativedeps-init").start();
+    return true;
+  }
+
+  private static boolean useDepsFileFromApkSync(final Context context, boolean extractToDisk) {
+    boolean success;
+    try {
+      success = initDeps(context, extractToDisk);
+    } catch (IOException e) {
+      // File does not exist or reading failed for some reason. We need to make
+      // sure the file was extracted from the APK.
+      success = false;
+    }
+
+    if (!success && extractToDisk) {
+      try {
+        NativeDepsUnpacker.ensureNativeDepsAvailable(context);
+        // Retry, now that we made sure the file was extracted.
+        success = initDeps(context, extractToDisk);
+      } catch (IOException e) {
+        // Failed to read native deps file. We can ignore the exception since
+        // we will fall back to using MinElf.
+      }
+    }
+
+    if (!success) {
+      Log.w(
+          LOG_TAG,
+          "Failed to extract native deps from APK, falling back to using MinElf to get library dependencies.");
+    }
+
+    return success;
+  }
+
+  private static boolean initDeps(final Context context, boolean extractToDisk) throws IOException {
+    verifyUninitialized();
+    byte[] depsBytes = null;
+    byte[] apkId = null;
+    if (extractToDisk) {
+      File apkFile = new File(context.getApplicationInfo().sourceDir);
+      apkId = SysUtil.makeApkDepBlock(apkFile, context);
+      depsBytes = NativeDepsUnpacker.readNativeDepsFromDisk(context);
+    } else {
+      depsBytes = NativeDepsUnpacker.readNativeDepsFromApk(context);
+      // ApkDepBlock is not needed if we are reading directly from APK
+    }
+
+    return processDepsBytes(apkId, depsBytes);
   }
 
   // Given the offset where the dependencies for a library begin in
@@ -136,13 +229,13 @@ public final class NativeDeps {
         ++byteOffset;
       }
     } catch (IndexOutOfBoundsException e) {
-      if (inLibName) {
+      if (inLibName && libNameBegin != bytes.length) {
         indexLib(libHash, libNameBegin);
       }
     }
   }
 
-  private static int verifyBytesAndGetOffset(byte[] apkId, byte[] bytes) {
+  private static int verifyBytesAndGetOffset(@Nullable byte[] apkId, @Nullable byte[] bytes) {
     if (apkId == null || apkId.length == 0) {
       return -1;
     }
@@ -165,25 +258,56 @@ public final class NativeDeps {
     return apkId.length + 4;
   }
 
-  // Reads deps file and builds indexes to quickly get deps from libraries.
-  private static boolean readDepsFromFile(byte[] apkId, String depsFilePath) throws IOException {
-    try (FileInputStream in = new FileInputStream(depsFilePath)) {
-      sEncodedDeps = new byte[in.available()];
-      in.read(sEncodedDeps);
-      int offset = verifyBytesAndGetOffset(apkId, sEncodedDeps);
-      if (offset == -1) {
-        sEncodedDeps = null;
-        return false;
-      }
-      sPrecomputedDeps = new HashMap<>(DEFAULT_LIBS_CAPACITY);
-      sPrecomputedLibs = new ArrayList<>(DEFAULT_LIBS_CAPACITY);
-      indexDepsBytes(sEncodedDeps, offset);
-    } catch (IOException e) {
-      // Release bytes that are not needed anymore and propagate exception
-      sEncodedDeps = null;
-      throw e;
+  private static int findNextLine(byte[] bytes, int offset) {
+    while (offset < bytes.length && bytes[offset] != '\n') {
+      offset++;
     }
 
+    if (offset < bytes.length) {
+      offset++;
+    }
+
+    return offset;
+  }
+
+  private static int parseLibCount(byte[] data, int offset, int length) {
+    try {
+      return Integer.parseInt(new String(data, offset, length));
+    } catch (NumberFormatException e) {
+      // Invalid data
+      return -1;
+    }
+  }
+
+  static boolean processDepsBytes(byte[] apkId, byte[] deps) throws IOException {
+    int offset = 0;
+    if (apkId != null) {
+      offset = verifyBytesAndGetOffset(apkId, deps);
+      if (offset == -1) {
+        return false;
+      }
+    }
+
+    int deps_offset = findNextLine(deps, offset);
+    if (deps_offset >= deps.length) {
+      return false;
+    }
+
+    int libsCount = parseLibCount(deps, offset, deps_offset - offset - 1);
+    if (libsCount <= 0) {
+      return false;
+    }
+
+    sPrecomputedDeps =
+        new HashMap<>((int) (libsCount / HASHMAP_LOAD_FACTOR) + 1, HASHMAP_LOAD_FACTOR);
+    sPrecomputedLibs = new ArrayList<>(libsCount);
+    indexDepsBytes(deps, deps_offset);
+
+    if (sPrecomputedLibs.size() != libsCount) {
+      return false;
+    }
+
+    sEncodedDeps = deps;
     sInitialized = true;
     return true;
   }
@@ -326,5 +450,18 @@ public final class NativeDeps {
     }
 
     return getDepsForLibAtOffset(offset, soName.length());
+  }
+
+  private static void verifyUninitialized() {
+    if (!sInitialized) {
+      return;
+    }
+
+    synchronized (NativeDeps.class) {
+      if (sInitialized) {
+        throw new IllegalStateException(
+            "Trying to initialize NativeDeps but it was already initialized");
+      }
+    }
   }
 }
